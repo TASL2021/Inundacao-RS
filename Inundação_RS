@@ -1,0 +1,219 @@
+// Função para filtrar e processar imagens Sentinel-2 e calcular NDWI
+function getSentinel2Images(startDate, endDate, roi) {
+  return ee.ImageCollection('COPERNICUS/S2')
+    .filterDate(startDate, endDate)
+    .filterBounds(roi)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+    .map(function(image) {
+      var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+      return image.addBands(ndwi).clip(roi);
+    });
+}
+
+// Definir a área de interesse (AOI)
+var roi = ee.FeatureCollection('users/thyagoanthonysoares/RS');
+
+// Estilizar o shapefile da área de interesse
+var aoiStyleParams = {
+  fillColor: '00000000',  // Fundo transparente
+  color: 'black',  // Cor das linhas da área de interesse (preto)
+  width: 1  // Largura das linhas
+};
+
+// Adicionar o shapefile da área de interesse ao mapa
+Map.addLayer(roi.style(aoiStyleParams), {}, 'Área de Interesse');
+
+// Carregar o shapefile de hidrografia
+var hidrografia = ee.FeatureCollection('users/thyagoanthonysoares/HidrografiaRS');
+
+// Estilizar o shapefile de hidrografia
+var hidrografiaStyleParams = {
+  color: 'blue'  // Cor das linhas da hidrografia (azul)
+};
+
+// Adicionar o shapefile de hidrografia ao mapa
+var hidrografiaLayer = Map.addLayer(hidrografia.style(hidrografiaStyleParams), {}, 'Hidrografia', true); // False para não mostrar inicialmente
+
+// Carregar o shapefile de massa de água
+var massaAgua = ee.FeatureCollection('users/thyagoanthonysoares/MassadaguaRS');
+
+// Estilizar o shapefile de massa de água
+var massaAguaStyleParams = {
+  fillColor: '0000FF',  // Cor de preenchimento da massa de água (azul)
+  color: '0000FF',  // Cor das linhas da massa de água (azul)
+  width: 1  // Largura das linhas
+};
+
+// Adicionar o shapefile de massa de água ao mapa
+var massaAguaLayer = Map.addLayer(massaAgua.style(massaAguaStyleParams), {}, 'Massa de Água', true); // False para não mostrar inicialmente
+
+// Carregar o shapefile de prédios
+var predios = ee.FeatureCollection('users/thyagoanthonysoares/ImoveisRS');
+
+// Estilizar o shapefile de prédios
+var prediosStyleParams = {
+  fillColor: '808080',  // Cor de preenchimento dos prédios (cinza)
+  color: '808080',  // Cor das linhas dos prédios (cinza)
+  width: 1  // Largura das linhas
+};
+
+// Adicionar o shapefile de prédios ao mapa
+var prediosLayer = Map.addLayer(predios.style(prediosStyleParams), {}, 'Imóveis', true); // False para não mostrar inicialmente
+
+// Função para filtrar e processar imagens Sentinel-1
+function getSentinel1Images(startDate, endDate, roi) {
+  return ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterDate(startDate, endDate)
+    .filterBounds(roi)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .select('VV')
+    .map(function(image) {
+      return image.clip(roi).resample('bilinear');
+    });
+}
+
+// Definir períodos de análise
+var preFloodStartDate = '2020-12-01';
+var preFloodEndDate = '2024-03-31';
+var floodStartDate = '2024-04-01';
+var floodEndDate = '2024-05-11';
+
+// Obter imagens Sentinel-1
+var preFloodImagesS1 = getSentinel1Images(preFloodStartDate, preFloodEndDate, roi);
+var floodImagesS1 = getSentinel1Images(floodStartDate, floodEndDate, roi);
+
+// Obter imagens Sentinel-2
+var preFloodImagesS2 = getSentinel2Images(preFloodStartDate, preFloodEndDate, roi);
+var floodImagesS2 = getSentinel2Images(floodStartDate, floodEndDate, roi);
+
+// Calcular a mediana das imagens pré e pós-inundação Sentinel-1
+var preFloodMedianS1 = preFloodImagesS1.median();
+var floodMedianS1 = floodImagesS1.median();
+
+// Calcular a mediana das imagens pré e pós-inundação Sentinel-2
+var preFloodMedianS2 = preFloodImagesS2.select('NDWI').median();
+var floodMedianS2 = floodImagesS2.select('NDWI').median();
+
+// Detectar mudanças na água usando uma diferença simples para Sentinel-1
+var diffS1 = floodMedianS1.subtract(preFloodMedianS1);
+
+// Detectar mudanças na água usando NDWI para Sentinel-2
+var diffS2 = floodMedianS2.subtract(preFloodMedianS2);
+
+// Aplicar thresholds para identificar mudanças significativas
+var floodThresholdS1 = -5; // Ajuste conforme necessário
+var floodThresholdS2 = 0.1; // Ajuste conforme necessário
+
+var floodMapS1 = diffS1.lt(floodThresholdS1);
+var floodMapS2 = diffS2.gt(floodThresholdS2);
+
+// Combinar resultados de Sentinel-1 e Sentinel-2
+var combinedFloodMap = floodMapS1.or(floodMapS2);
+
+// Calcular a mudança na razão de retroespalhamento para detectar deslizamentos
+var backscatterChange = floodMedianS1.divide(preFloodMedianS1).log10().multiply(10);
+  
+// Aplicar um threshold para detectar deslizamentos
+var landslideThreshold = 3; // Ajuste conforme necessário
+var landslideMap = backscatterChange.gt(landslideThreshold);
+
+// Obter DEM e calcular a inclinação
+var dem = ee.Image('USGS/SRTMGL1_003').clip(roi);
+var slope = ee.Terrain.slope(dem);
+
+// Aplicar um threshold de inclinação para refinar a detecção de deslizamentos
+var slopeThreshold = 15; // Ajuste conforme necessário
+var steepAreas = slope.gt(slopeThreshold);
+// Refinar o mapa de deslizamentos considerando apenas áreas íngremes
+var refinedLandslideMap = landslideMap.and(steepAreas);
+
+// Refinar o mapa de inundações considerando apenas áreas planas
+var flatAreas = slope.lt(slopeThreshold);
+var refinedFloodMap = combinedFloodMap.and(flatAreas);
+
+// Visualizar os resultados
+Map.centerObject(roi, 10);
+Map.addLayer(preFloodMedianS1, {min: -25, max: 0}, 'Pre-Flood VV (Sentinel-1)', false);
+Map.addLayer(floodMedianS1, {min: -25, max: 0}, 'Flood VV (Sentinel-1)', false);
+Map.addLayer(preFloodMedianS2, {min: -1, max: 1, palette: ['00FFFF', '0000FF']}, 'Pre-Flood NDWI (Sentinel-2)', false);
+Map.addLayer(floodMedianS2, {min: -1, max: 1, palette: ['00FFFF', '0000FF']}, 'Flood NDWI (Sentinel-2)', false);
+var refinedFloodedAreasLayer = Map.addLayer(refinedFloodMap.updateMask(refinedFloodMap), {palette: ['blue']}, 'Refined Flooded Areas', true);
+var refinedLandslideAreasLayer = Map.addLayer(refinedLandslideMap.updateMask(refinedLandslideMap), {palette: ['red']}, 'Refined Landslide Areas', true);
+
+// Baixar os shapefiles
+Export.table.toDrive({
+  collection: roi,
+  description: 'Limites_RS',
+  fileFormat: 'SHP'
+});
+
+Export.table.toDrive({
+  collection: hidrografia,
+  description: 'Hidrografia_RS',
+  fileFormat: 'SHP'
+});
+
+Export.table.toDrive({
+  collection: massaAgua,
+  description: 'MassaAgua_RS',
+  fileFormat: 'SHP'
+});
+
+Export.table.toDrive({
+  collection: predios,
+  description: 'Imoveis_RS',
+  fileFormat: 'SHP'
+});
+
+// Exportar imagens raster
+Export.image.toDrive({
+  image: refinedFloodMap,
+  description: 'Areas_Inundadas',
+  scale: 10,
+  region: roi,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: refinedLandslideMap,
+  description: 'Areas_Deslizamento',
+  scale: 10,
+  region: roi,
+  fileFormat: 'GeoTIFF'
+});
+// Exportar imagens Sentinel-1 pré-inundação
+Export.image.toDrive({
+  image: preFloodMedianS1,
+  description: 'PreFlood_S1',
+  scale: 10,
+  region: roi,
+  fileFormat: 'GeoTIFF'
+});
+
+// Exportar imagens Sentinel-1 pós-inundação
+Export.image.toDrive({
+  image: floodMedianS1,
+  description: 'Flood_S1',
+  scale: 10,
+  region: roi,
+  fileFormat: 'GeoTIFF'
+});
+
+// Exportar imagens Sentinel-2 pré-inundação
+Export.image.toDrive({
+  image: preFloodMedianS2,
+  description: 'PreFlood_S2',
+  scale: 10,
+  region: roi,
+  fileFormat: 'GeoTIFF'
+});
+
+// Exportar imagens Sentinel-2 pós-inundação
+Export.image.toDrive({
+  image: floodMedianS2,
+  description: 'Flood_S2',
+  scale: 10,
+  region: roi,
+  fileFormat: 'GeoTIFF'
+});
